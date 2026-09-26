@@ -20,11 +20,11 @@ async def handle_game_client(websocket):
 
 async def main():
     print("========================================")
-    print(" Listening on ws://127.0.0.1:8080 ... ")
+    print(" Listening on ws://127.0.0.1:4444 ... ")
     print(" Launch Picture Poker now!")
     print("========================================\n")
     
-    async with websockets.serve(handle_game_client, "127.0.0.1", 8080):
+    async with websockets.serve(handle_game_client, "127.0.0.1", 4444):
         await asyncio.Future()  # Keeps the server running indefinitely
 
 if __name__ == "__main__":
