@@ -17,6 +17,12 @@
       <Private>False</Private>
     </Reference>
 
+    <!-- Game Code Assembly (Provides GameSettings) -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\Picture Poker_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
     <!-- Game Networking -->
     <Reference Include="websocket-sharp">
       <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\Picture Poker_Data\Managed\websocket-sharp.dll</HintPath>

@@ -2,106 +2,78 @@ using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using System;
-using System.Linq;
-using System.Reflection;
-using WebSocketSharp;
 
 namespace PicturePokerRedirector
 {
-    [BepInPlugin("com.local.picturepoker.redirector", "Picture Poker Local Redirector", "1.0.0")]
+    [BepInPlugin("com.yourname.picturepoker.redirector", "Picture Poker Server Redirector", "1.0.0")]
     public class Plugin : BaseUnityPlugin
     {
-        public static ConfigEntry<string> ServerAddress;
+        public static ConfigEntry<string> TargetWsUrl;
+        public static ConfigEntry<string> TargetHttpUrl;
+        public static BepInEx.Logging.ManualLogSource ModLogger;
 
         private void Awake()
         {
-            ServerAddress = Config.Bind(
-                "Network",
-                "ServerAddress",
-                "ws://127.0.0.1:4444",
-                "The WebSocket server URL to redirect game traffic to."
+            ModLogger = Logger;
+
+            TargetWsUrl = Config.Bind(
+                "Server Settings",
+                "ServerWSUrl",
+                "ws://127.0.0.1:4444/",
+                "The target WebSocket URL for multiplayer traffic."
             );
 
-            Harmony harmony = new Harmony("com.local.picturepoker.redirector");
-            
-            MethodInfo prefix = typeof(WebSocketPatch).GetMethod(nameof(WebSocketPatch.Prefix), BindingFlags.Static | BindingFlags.Public);
-            
-            // Get constructors that accept a parameter named "url"
-            var targetConstructors = typeof(WebSocket)
-                .GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(ctor => ctor.GetParameters().Any(p => p.Name.Equals("url", StringComparison.OrdinalIgnoreCase)));
+            TargetHttpUrl = Config.Bind(
+                "Server Settings",
+                "ServerHttpUrl",
+                "http://127.0.0.1:4444/",
+                "The target HTTP URL for API traffic."
+            );
 
-            int patchedCount = 0;
-            foreach (var ctor in targetConstructors)
-            {
-                harmony.Patch(ctor, prefix: new HarmonyMethod(prefix));
-                patchedCount++;
-            }
+            Harmony harmony = new Harmony("com.yourname.picturepoker.redirector");
+            harmony.PatchAll();
 
-            Logger.LogInfo($"Redirector initialized! Patched {patchedCount} WebSocket constructor(s). Target: {ServerAddress.Value}");
+            Logger.LogInfo($"[Redirector Mod] Loaded successfully!");
         }
     }
 
-    public static class WebSocketPatch
+    // Intercept WebSocket URL
+    [HarmonyPatch(typeof(GameSettings), "serverWSUrl", MethodType.Getter)]
+    public static class ServerWsUrlGetterPatch
     {
-        public static void Prefix(ref string url)
+        public static void Postfix(ref string __result)
         {
-            if (string.IsNullOrEmpty(url)) return;
+            // Log the raw, original string defined in GameSettings
+            Plugin.ModLogger.LogInfo($"[ORIGINAL WS URI] Intercepted default: {__result}");
 
-            UnityEngine.Debug.Log($"[Redirector] >>> ORIGINAL URL DETECTED: {url}");
-
-            try
+            string customUrl = Plugin.TargetWsUrl.Value;
+            if (!customUrl.EndsWith("/"))
             {
-                string targetBase = Plugin.ServerAddress.Value.Trim();
-                if (!targetBase.StartsWith("ws://", StringComparison.OrdinalIgnoreCase) &&
-                    !targetBase.StartsWith("wss://", StringComparison.OrdinalIgnoreCase))
-                {
-                    targetBase = "ws://" + targetBase;
-                }
-
-                Uri targetBaseUri = new Uri(targetBase);
-
-                if (Uri.TryCreate(url, UriKind.Absolute, out Uri origAbsolute))
-                {
-                    UriBuilder builder = new UriBuilder(targetBaseUri)
-                    {
-                        Path = origAbsolute.AbsolutePath,
-                        Query = origAbsolute.Query
-                    };
-                    url = builder.ToString();
-                }
-                else if (Uri.TryCreate(url, UriKind.Relative, out Uri origRelative))
-                {
-                    string relString = origRelative.ToString();
-                    string path = relString;
-                    string query = "";
-
-                    int qIdx = relString.IndexOf('?');
-                    if (qIdx >= 0)
-                    {
-                        path = relString.Substring(0, qIdx);
-                        query = relString.Substring(qIdx + 1);
-                    }
-
-                    UriBuilder builder = new UriBuilder(targetBaseUri)
-                    {
-                        Path = path,
-                        Query = query
-                    };
-                    url = builder.ToString();
-                }
-                else
-                {
-                    url = targetBaseUri.ToString();
-                }
-            }
-            catch (Exception ex)
-            {
-                UnityEngine.Debug.LogError($"[Redirector] Parsing failed: {ex.Message}");
-                url = Plugin.ServerAddress.Value;
+                customUrl += "/";
             }
 
-            UnityEngine.Debug.Log($"[Redirector] >>> REDIRECTED URL (Preserved): {url}");
+            // Overwrite with custom server URL
+            __result = customUrl;
+        }
+    }
+
+    // Intercept HTTP API URL
+    [HarmonyPatch(typeof(GameSettings), "serverHttpUrl", MethodType.Getter)]
+    public static class ServerHttpUrlGetterPatch
+    {
+        public static void Postfix(ref string __result)
+        {
+            // Log the raw, original string defined in GameSettings
+            Plugin.ModLogger.LogInfo($"[ORIGINAL HTTP URI] Intercepted default: {__result}");
+
+            string customUrl = Plugin.TargetHttpUrl.Value;
+            if (!customUrl.EndsWith("/"))
+            {
+                customUrl += "/";
+            }
+
+            // Overwrite with custom server URL
+            __result = customUrl;
         }
     }
 }
