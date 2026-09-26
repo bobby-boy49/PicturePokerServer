@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>PicturePokerRedirector</AssemblyName>
+    <OutputType>Library</OutputType>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BepInEx & Harmony -->
+    <Reference Include="BepInEx">
+      <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- Game Networking -->
+    <Reference Include="websocket-sharp">
+      <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\Picture Poker_Data\Managed\websocket-sharp.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+
+    <!-- Unity Base Assemblies (Fixes CS0012) -->
+    <Reference Include="UnityEngine">
+      <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\Picture Poker_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\Picture Poker_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
