@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 HOST_IP = "0.0.0.0"
-PORT = 4444
+PORT = 8080
 
 LOBBIES = {}
 STATE_LOCK = asyncio.Lock()
