@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import websockets
 from datetime import datetime
 
@@ -17,7 +18,7 @@ logging.basicConfig(
 # GLOBAL CONSTANTS & ROOM STATE
 # ------------------------------------------------------------------------------
 MAX_PLAYERS = 4
-HOST_IP = "0.0.0.0"  # Listens on all local and network interfaces
+HOST_IP = "0.0.0.0"
 PORT = 8080
 
 ROOM_STATE = {
@@ -34,16 +35,23 @@ ROOM_STATE = {
     "players": []
 }
 
-# Maps client_id -> websocket instance
 CONNECTED_CLIENTS = {}
-
-# Async lock to prevent race conditions during concurrent client handshakes/disconnects
 STATE_LOCK = asyncio.Lock()
 
 
 # ------------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # ------------------------------------------------------------------------------
+def extract_int(data_val, default=0):
+    """Safely extracts an integer from numbers or string payloads like 'RoundChange: 5'."""
+    if isinstance(data_val, int):
+        return data_val
+    if isinstance(data_val, str):
+        match = re.search(r'\d+', data_val)
+        if match:
+            return int(match.group(0))
+    return default
+
 def get_available_player_number():
     """Finds the lowest available playerNumber slot between 0 and MAX_PLAYERS - 1."""
     taken_numbers = {p["playerNumber"] for p in ROOM_STATE["players"]}
@@ -67,8 +75,6 @@ async def broadcast_lobby():
             "data": ROOM_STATE
         }
         msg = json.dumps(payload)
-        
-        # Snapshot clients to safely iterate
         active_clients = list(CONNECTED_CLIENTS.values())
 
     for ws in active_clients:
@@ -81,7 +87,6 @@ async def broadcast_lobby():
     logging.info(f"[>] Broadcasted 'LobbyUpdated' | Players: {len(ROOM_STATE['players'])}/{MAX_PLAYERS}")
 
 async def send_packet(websocket, msg_type, pid="", name="", login="", data=""):
-    """Sends a formatted JSON packet to a specific websocket connection."""
     payload = {
         "type": msg_type,
         "id": pid,
@@ -96,7 +101,6 @@ async def send_packet(websocket, msg_type, pid="", name="", login="", data=""):
         logging.error(f"Failed sending '{msg_type}' to {pid}: {err}")
 
 async def broadcast_packet(msg_type, pid="", name="", login="", data=""):
-    """Broadcasts a non-state payload (e.g., cards, bets, chat) to all clients."""
     payload = {
         "type": msg_type,
         "id": pid,
@@ -146,14 +150,12 @@ async def handle_game_client(websocket):
             # 1. HELLO / HANDSHAKE
             if msg_type == "Hello":
                 async with STATE_LOCK:
-                    # Enforce max room capacity
                     if len(ROOM_STATE["players"]) >= MAX_PLAYERS and pid not in [p["id"] for p in ROOM_STATE["players"]]:
                         logging.warning(f"[!] Rejecting connection from {pid}: Room Full ({MAX_PLAYERS}/{MAX_PLAYERS})")
                         await send_packet(websocket, "Error", pid=pid, data="Room is full.")
                         await websocket.close(1008, "Room Full")
                         return
 
-                    # Resolve duplicate hardware/user ID collisions (for local multi-client testing)
                     base_id = pid
                     counter = 2
                     while pid in CONNECTED_CLIENTS and CONNECTED_CLIENTS[pid] != websocket:
@@ -164,7 +166,6 @@ async def handle_game_client(websocket):
                     client_id = pid
                     CONNECTED_CLIENTS[client_id] = websocket
 
-                    # First client becomes room host
                     if not ROOM_STATE["host"]:
                         ROOM_STATE["host"] = pid
 
@@ -189,7 +190,6 @@ async def handle_game_client(websocket):
                     
                     assigned_pnum = existing_player["playerNumber"]
 
-                # Acknowledge handshake back to client with assigned player slot index
                 await send_packet(websocket, "Hello", pid=pid, name=pname, login=plogin, data=str(assigned_pnum))
                 await broadcast_lobby()
 
@@ -212,11 +212,7 @@ async def handle_game_client(websocket):
 
             # 4. COIN SYNC
             elif msg_type == "MyCoins":
-                try:
-                    coin_val = int(pdata) if pdata is not None else 0
-                except ValueError:
-                    coin_val = 0
-
+                coin_val = extract_int(pdata, default=0)
                 async with STATE_LOCK:
                     for p in ROOM_STATE["players"]:
                         if p["id"] == pid:
@@ -224,14 +220,11 @@ async def handle_game_client(websocket):
                 await broadcast_lobby()
 
             # 5. LOBBY SETTINGS (ROUND COUNT & TIMER)
-            elif msg_type == "SetRoundCount":
-                if pdata is not None:
-                    async with STATE_LOCK:
-                        try:
-                            ROOM_STATE["roundCount"] = int(pdata)
-                        except ValueError:
-                            pass
-                    await broadcast_lobby()
+            elif msg_type in ("SetRoundCount", "LobbyRoundChange"):
+                new_rounds = extract_int(pdata, default=ROOM_STATE["roundCount"])
+                async with STATE_LOCK:
+                    ROOM_STATE["roundCount"] = new_rounds
+                await broadcast_lobby()
 
             elif msg_type == "SetTimer":
                 async with STATE_LOCK:
@@ -269,13 +262,9 @@ async def handle_game_client(websocket):
             if client_id and client_id in CONNECTED_CLIENTS:
                 del CONNECTED_CLIENTS[client_id]
             
-            # Remove client from room state
             ROOM_STATE["players"] = [p for p in ROOM_STATE["players"] if p["id"] != client_id]
-            
-            # Re-index remaining players so slots remain clean (0..N)
             reindex_player_numbers()
 
-            # Migrate host if the current host disconnected
             if ROOM_STATE["host"] == client_id:
                 ROOM_STATE["host"] = ROOM_STATE["players"][0]["id"] if ROOM_STATE["players"] else ""
                 
@@ -295,7 +284,6 @@ async def main():
     logging.info(f" Max Players: {MAX_PLAYERS}")
     logging.info("========================================\n")
     
-    # Server with socket ping interval & timeout to keep connections alive
     async with websockets.serve(
         handle_game_client, 
         HOST_IP, 
