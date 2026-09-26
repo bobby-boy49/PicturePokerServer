@@ -7,11 +7,15 @@ import websockets
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("log.txt", mode="a"),
+        logging.StreamHandler()
+    ]
 )
 
 HOST_IP = "0.0.0.0"
-PORT = 8080
+PORT = 4444
 
 LOBBIES = {}
 STATE_LOCK = asyncio.Lock()
@@ -37,8 +41,8 @@ def get_or_create_lobby(lobby_id):
                 "isPrivate": False,
                 "inProgress": False,
                 "currentRound": 0,
-                "roundCount": 5,
-                "playersExpected": 4,
+                "roundCount": 7,  # Default updated to match 7-round game config from client logs
+                "playersExpected": 2,  # Configured for standard 2-player Picture Poker matches
                 "useTimer": True,
                 "players": []
             },
@@ -47,17 +51,23 @@ def get_or_create_lobby(lobby_id):
     return LOBBIES[lobby_id]
 
 
+async def send_payload(websocket, message, recipient_info="Client"):
+    try:
+        await websocket.send(message)
+        logging.info(f"[>] SEND ({recipient_info}): {message}")
+    except Exception as err:
+        logging.error(f"Failed to send to {recipient_info}: {err}")
+
+
 async def broadcast_to_lobby(lobby_id, message, exclude_ws=None):
     lobby = LOBBIES.get(lobby_id)
     if not lobby:
         return
 
-    for cid, ws in list(lobby["clients"].items()):
+    active_clients = list(lobby["clients"].items())
+    for cid, ws in active_clients:
         if ws != exclude_ws and ws.state.name == "OPEN":
-            try:
-                await ws.send(message)
-            except Exception as err:
-                logging.error(f"Failed to send to {cid}: {err}")
+            await send_payload(ws, message, recipient_info=f"Player:{cid}")
 
 
 async def broadcast_lobby_state(room_id):
@@ -82,6 +92,8 @@ async def handle_game_client(websocket):
 
     try:
         async for message in websocket:
+            logging.info(f"[<] RECV ({peer_addr}): {message}")
+
             try:
                 packet = json.loads(message)
             except (json.JSONDecodeError, TypeError):
@@ -91,8 +103,12 @@ async def handle_game_client(websocket):
             pid = packet.get("id") or f"Player-{peer_addr[1]}"
             pname = packet.get("name") or "Player"
             pdata = packet.get("data")
-
             room_id = packet.get("lobbyId") or packet.get("room") or current_lobby_id
+
+            should_broadcast_state = False
+            round_advanced = False
+            message_to_relay = None
+            exclude_relay_sender = True
 
             async with STATE_LOCK:
                 lobby = get_or_create_lobby(room_id)
@@ -115,12 +131,17 @@ async def handle_game_client(websocket):
                             "playerNumber": slot_num,
                             "registered": True,
                             "color": {"r": 1.0, "g": 1.0, "b": 1.0},
-                            "inGame": False,
+                            "inGame": lobby["state"]["inProgress"],
                             "ready": False,
                             "isServerBot": False,
-                            "coins": 30
+                            "coins": 30,
+                            "connected": True
                         }
                         lobby["state"]["players"].append(existing_p)
+                    else:
+                        existing_p["connected"] = True
+                        if lobby["state"]["inProgress"]:
+                            existing_p["inGame"] = True
 
                     ack_packet = {
                         "type": "Hello",
@@ -128,11 +149,18 @@ async def handle_game_client(websocket):
                         "name": pname,
                         "data": str(existing_p["playerNumber"])
                     }
-                    await websocket.send(json.dumps(ack_packet))
-                    await broadcast_lobby_state(room_id)
-                    logging.info(f"[Lobby {room_id}] Player '{pname}' ({client_id}) joined.")
+                    await send_payload(websocket, json.dumps(ack_packet), recipient_info=f"Player:{client_id}")
+                    should_broadcast_state = True
 
-                # 2. SERVER-AUTHORITATIVE ROUND & GAME CONFIGURATION
+                # 2. LOBBY CONFIGURATION
+                elif msg_type in ("SetRoundCount", "LobbyRoundChange"):
+                    if lobby["state"]["inProgress"]:
+                        logging.warning(f"Ignored {msg_type} from {client_id}: Game in progress.")
+                    else:
+                        new_rounds = extract_int(pdata, default=lobby["state"]["roundCount"])
+                        lobby["state"]["roundCount"] = new_rounds
+                        should_broadcast_state = True
+
                 elif msg_type == "Start":
                     lobby["state"]["inProgress"] = True
                     lobby["state"]["currentRound"] = 1
@@ -140,36 +168,66 @@ async def handle_game_client(websocket):
                         p["inGame"] = True
                         p["ready"] = False
                     
-                    await broadcast_lobby_state(room_id)
-                    await broadcast_to_lobby(room_id, message, exclude_ws=websocket)
+                    should_broadcast_state = True
+                    message_to_relay = message
 
-                elif msg_type in ("SetRoundCount", "LobbyRoundChange"):
-                    new_rounds = extract_int(pdata, default=lobby["state"]["roundCount"])
-                    lobby["state"]["roundCount"] = new_rounds
-                    await broadcast_lobby_state(room_id)
-
-                elif msg_type in ("GameReady", "ReadyForNextRound"):
+                # 3. GAMEPLAY & ROUND SYNC
+                elif msg_type == "GameReady":
                     for p in lobby["state"]["players"]:
-                        if p["id"] == client_id or p["id"] == pid:
+                        if p["id"] in (client_id, pid):
+                            if lobby["state"]["inProgress"]:
+                                p["inGame"] = True
+                    should_broadcast_state = True
+
+                elif msg_type == "ReadyForNextRound":
+                    for p in lobby["state"]["players"]:
+                        if p["id"] in (client_id, pid):
                             p["ready"] = True
-                    
-                    # Advance round counter if everyone is ready for the next round
-                    if all(p["ready"] for p in lobby["state"]["players"]):
+
+                    # Advance round ONLY when all active players confirm round completion
+                    active_players = [p for p in lobby["state"]["players"] if p.get("connected", True)]
+                    if len(active_players) > 0 and all(p["ready"] for p in active_players):
                         lobby["state"]["currentRound"] += 1
                         for p in lobby["state"]["players"]:
                             p["ready"] = False
+                        round_advanced = True
 
-                    await broadcast_lobby_state(room_id)
-                    await broadcast_to_lobby(room_id, message, exclude_ws=websocket)
+                    should_broadcast_state = True
+                    message_to_relay = message
+
+                # Handle coin/poker hand state updates explicitly
+                elif msg_type == "UpdatePlayerCoins":
+                    new_coins = extract_int(pdata, default=None)
+                    if new_coins is not None:
+                        for p in lobby["state"]["players"]:
+                            if p["id"] in (client_id, pid):
+                                p["coins"] = new_coins
+                        should_broadcast_state = True
+                    message_to_relay = message
 
                 elif msg_type == "LobbyUpdated":
-                    if isinstance(pdata, dict):
+                    if isinstance(pdata, dict) and not lobby["state"]["inProgress"]:
                         lobby["state"].update(pdata)
-                    await broadcast_to_lobby(room_id, message, exclude_ws=websocket)
+                        should_broadcast_state = True
 
-                # 3. DIRECT P2P RELAY (Cards, Holds, Bets, Chats)
+                # 4. DIRECT RELAY (Cards dealt, held, drawn, shown down)
                 else:
-                    await broadcast_to_lobby(room_id, message, exclude_ws=websocket)
+                    message_to_relay = message
+
+            # Execute I/O and broadcasts outside STATE_LOCK
+            if should_broadcast_state:
+                await broadcast_lobby_state(room_id)
+
+            if round_advanced:
+                next_round_event = json.dumps({
+                    "type": "RoundStart",
+                    "round": lobby["state"]["currentRound"]
+                })
+                await broadcast_to_lobby(room_id, next_round_event, exclude_ws=None)
+
+            if message_to_relay:
+                exclude = websocket if exclude_relay_sender else None
+                await broadcast_to_lobby(room_id, message_to_relay, exclude_ws=exclude)
 
     except (websockets.exceptions.ConnectionClosedOK, websockets.exceptions.ConnectionClosedError):
         pass
@@ -178,19 +236,19 @@ async def handle_game_client(websocket):
             lobby = LOBBIES.get(current_lobby_id)
             if lobby and client_id in lobby["clients"]:
                 del lobby["clients"][client_id]
-                lobby["state"]["players"] = [p for p in lobby["state"]["players"] if p["id"] != client_id]
-
-                for idx, player in enumerate(lobby["state"]["players"]):
-                    player["playerNumber"] = idx
-
-                if lobby["state"]["host"] == client_id:
-                    lobby["state"]["host"] = lobby["state"]["players"][0]["id"] if lobby["state"]["players"] else ""
+                
+                p_record = next((p for p in lobby["state"]["players"] if p["id"] == client_id), None)
+                if p_record:
+                    p_record["connected"] = False
 
                 if not lobby["clients"]:
                     del LOBBIES[current_lobby_id]
                     logging.info(f"[-] Lobby {current_lobby_id} closed (empty).")
                 else:
-                    await broadcast_lobby_state(current_lobby_id)
+                    should_broadcast_state = True
+
+        if current_lobby_id in LOBBIES:
+            await broadcast_lobby_state(current_lobby_id)
 
         logging.info(f"[-] Client {peer_addr} disconnected.")
 
