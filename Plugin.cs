@@ -2,6 +2,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using System;
+using System.Text.RegularExpressions;
 using UnityEngine;
 
 namespace PicturePokerRedirector
@@ -117,43 +118,59 @@ namespace PicturePokerRedirector
 
         public static string CleanHostInput(string host)
         {
-            if (string.IsNullOrEmpty(host)) return DEFAULT_SERVER_HOST;
+            if (string.IsNullOrWhiteSpace(host)) return DEFAULT_SERVER_HOST;
 
             host = host.Trim();
+
+            // Strip scheme if present
             if (host.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(8);
             else if (host.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(7);
             else if (host.StartsWith("wss://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(6);
             else if (host.StartsWith("ws://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(5);
 
-            return host.TrimEnd('/');
+            // Strip trailing slashes or spaces
+            return host.TrimEnd('/').Trim();
+        }
+
+        public static bool IsLocalHost(string host)
+        {
+            string cleaned = CleanHostInput(host);
+
+            if (cleaned.StartsWith("localhost", StringComparison.OrdinalIgnoreCase) || 
+                cleaned.StartsWith("127.", StringComparison.OrdinalIgnoreCase) || 
+                cleaned.StartsWith("192.168.", StringComparison.OrdinalIgnoreCase) || 
+                cleaned.StartsWith("10.", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // Check for 172.16.x.x - 172.31.x.x subnet block
+            if (cleaned.StartsWith("172."))
+            {
+                string[] parts = cleaned.Split('.');
+                if (parts.Length >= 2 && int.TryParse(parts[1], out int secondOctet))
+                {
+                    if (secondOctet >= 16 && secondOctet <= 31)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
         }
 
         public static string GetFormattedWsUrl()
         {
             string host = CleanHostInput(TargetServerHost.Value);
-            
-            // Support all common local network address blocks and loopbacks
-            bool isLocal = host.StartsWith("127.0.0.1") || 
-                           host.StartsWith("localhost") || 
-                           host.StartsWith("192.168.") || 
-                           host.StartsWith("10.") || 
-                           host.StartsWith("172.");
-
-            string scheme = isLocal ? "ws://" : "wss://";
+            string scheme = IsLocalHost(host) ? "ws://" : "wss://";
             return $"{scheme}{host}/";
         }
 
         public static string GetFormattedHttpUrl()
         {
             string host = CleanHostInput(TargetServerHost.Value);
-            
-            bool isLocal = host.StartsWith("127.0.0.1") || 
-                           host.StartsWith("localhost") || 
-                           host.StartsWith("192.168.") || 
-                           host.StartsWith("10.") || 
-                           host.StartsWith("172.");
-
-            string scheme = isLocal ? "http://" : "https://";
+            string scheme = IsLocalHost(host) ? "http://" : "https://";
             return $"{scheme}{host}/";
         }
     }
