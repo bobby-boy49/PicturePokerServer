@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
+import hashlib
 import json
 import logging
-import re
-import websockets
+import urllib.parse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,34 +16,45 @@ logging.basicConfig(
 )
 
 HOST_IP = "0.0.0.0"
-PORT = 8080
+PORT = 4444
 
 LOBBIES = {}
 STATE_LOCK = asyncio.Lock()
 
 
-def extract_int(val, default=0):
-    if isinstance(val, int):
-        return val
-    if isinstance(val, str):
-        match = re.search(r'\d+', val)
-        if match:
-            return int(match.group(0))
-    return default
+class WSMsgType:
+    MyCards = "MyCards"
+    MyCoins = "MyCoins"
+    Hello = "Hello"
+    DrawHoldPressed = "DrawHoldPressed"
+    SelectedCardsChanged = "SelectedCardsChanged"
+    LobbyUpdated = "LobbyUpdated"
+    ChatMessage = "ChatMessage"
+    SetRoundCount = "SetRoundCount"
+    Start = "Start"
+    GameReady = "GameReady"
+    ReadyForNextRound = "ReadyForNextRound"
+    Disconnect = "Disconnect"
+    LobbyBetChange = "LobbyBetChange"
+    LobbyRoundChange = "LobbyRoundChange"
+    SetTimer = "SetTimer"
 
 
 def get_or_create_lobby(lobby_id):
     if lobby_id not in LOBBIES:
+        logging.info(f"[+] Init lobby state: {lobby_id}")
         LOBBIES[lobby_id] = {
             "state": {
                 "id": lobby_id,
+                "code": lobby_id,
+                "roomCode": lobby_id,
                 "host": "",
                 "betMultiplier": 1,
-                "isPrivate": False,
+                "isPrivate": True,
                 "inProgress": False,
                 "currentRound": 0,
-                "roundCount": 7,  # Default updated to match 7-round game config from client logs
-                "playersExpected": 2,  # Configured for standard 2-player Picture Poker matches
+                "roundCount": 5,
+                "playersExpected": 2,
                 "useTimer": True,
                 "players": []
             },
@@ -51,222 +63,253 @@ def get_or_create_lobby(lobby_id):
     return LOBBIES[lobby_id]
 
 
-async def send_payload(websocket, message, recipient_info="Client"):
-    try:
-        await websocket.send(message)
-        logging.info(f"[>] SEND ({recipient_info}): {message}")
-    except Exception as err:
-        logging.error(f"Failed to send to {recipient_info}: {err}")
+async def read_exact(reader, num_bytes):
+    data = b""
+    while len(data) < num_bytes:
+        chunk = await reader.read(num_bytes - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
 
 
-async def broadcast_to_lobby(lobby_id, message, exclude_ws=None):
+async def send_ws_frame(writer, payload_str):
+    payload_bytes = payload_str.encode("utf-8")
+    frame_header = bytearray([0x81])
+    length = len(payload_bytes)
+    
+    if length <= 125:
+        frame_header.append(length)
+    elif length <= 65535:
+        frame_header.append(126)
+        frame_header.extend(length.to_bytes(2, 'big'))
+    else:
+        frame_header.append(127)
+        frame_header.extend(length.to_bytes(8, 'big'))
+
+    writer.write(frame_header + payload_bytes)
+    await writer.drain()
+
+
+async def broadcast_to_lobby(lobby_id, message, exclude_writer=None):
     lobby = LOBBIES.get(lobby_id)
     if not lobby:
         return
-
-    active_clients = list(lobby["clients"].items())
-    for cid, ws in active_clients:
-        if ws != exclude_ws and ws.state.name == "OPEN":
-            await send_payload(ws, message, recipient_info=f"Player:{cid}")
+    for cid, client_info in list(lobby["clients"].items()):
+        writer = client_info["writer"]
+        if writer != exclude_writer:
+            try:
+                await send_ws_frame(writer, message)
+            except Exception as err:
+                logging.error(f"[!] Broadcast failed to {cid}: {err}")
 
 
 async def broadcast_lobby_state(room_id):
     lobby = LOBBIES.get(room_id)
     if not lobby:
         return
-    
     lobby_update = {
-        "type": "LobbyUpdated",
-        "player": "System",
+        "type": WSMsgType.LobbyUpdated,
+        "id": "Server",
+        "name": "Server",
+        "login": "Server",
         "data": lobby["state"]
     }
-    await broadcast_to_lobby(room_id, json.dumps(lobby_update))
+    for cid, client_info in list(lobby["clients"].items()):
+        try:
+            await send_ws_frame(client_info["writer"], json.dumps(lobby_update))
+        except Exception as err:
+            logging.error(f"[!] State send failed to {cid}: {err}")
 
 
-async def handle_game_client(websocket):
-    current_lobby_id = "PUBLIC"
-    client_id = None
-    peer_addr = websocket.remote_address
-
+async def handle_client(reader, writer):
+    peer_addr = writer.get_extra_info('peername')
     logging.info(f"[+] Client connected from {peer_addr}")
 
+    current_lobby_id = "PUBLIC"
+    client_id = None
+
     try:
-        async for message in websocket:
-            logging.info(f"[<] RECV ({peer_addr}): {message}")
+        request_data = b""
+        while b"\r\n\r\n" not in request_data:
+            chunk = await reader.read(1024)
+            if not chunk:
+                break
+            request_data += chunk
 
-            try:
-                packet = json.loads(message)
-            except (json.JSONDecodeError, TypeError):
-                continue
+        if not request_data:
+            writer.close()
+            await writer.wait_closed()
+            return
 
-            msg_type = packet.get("type")
-            pid = packet.get("id") or f"Player-{peer_addr[1]}"
-            pname = packet.get("name") or "Player"
-            pdata = packet.get("data")
-            room_id = packet.get("lobbyId") or packet.get("room") or current_lobby_id
+        header_text = request_data.decode("utf-8", errors="ignore")
+        lines = header_text.split("\r\n")
+        request_line = lines[0] if lines else ""
+        parts = request_line.split(" ")
+        
+        if len(parts) < 2:
+            writer.close()
+            await writer.wait_closed()
+            return
 
-            should_broadcast_state = False
-            round_advanced = False
-            message_to_relay = None
-            exclude_relay_sender = True
+        method, path = parts[0], parts[1]
+        headers = {
+            line.split(":", 1)[0].strip().lower(): line.split(":", 1)[1].strip()
+            for line in lines[1:] if ":" in line
+        }
 
-            async with STATE_LOCK:
-                lobby = get_or_create_lobby(room_id)
-                current_lobby_id = room_id
+        # REST lobby creation handler
+        if "createlobby" in path or "create" in path or (method == "POST" and "lobby" in path):
+            lobby_code = "PUBLIC"
+            response_payload = json.dumps({"code": lobby_code, "roomCode": lobby_code, "id": lobby_code}).encode("utf-8")
+            http_response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json; charset=UTF-8\r\n"
+                f"Content-Length: {len(response_payload)}\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            writer.write(http_response.encode("utf-8") + response_payload)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
 
-                # 1. CONNECT & LOBBY REGISTRATION
-                if msg_type in ("Hello", "CreateLobby", "JoinLobby", "PublicGame", "SearchMatch"):
-                    client_id = pid
-                    lobby["clients"][client_id] = websocket
+        # WebSocket Handshake
+        if headers.get("upgrade", "").lower() == "websocket":
+            ws_key = headers.get("sec-websocket-key", "")
+            guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            sha1 = hashlib.sha1((ws_key + guid).encode("utf-8")).digest()
+            ws_accept = base64.b64encode(sha1).decode("utf-8")
 
-                    if not lobby["state"]["host"]:
-                        lobby["state"]["host"] = client_id
+            handshake_str = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {ws_accept}\r\n"
+                "Access-Control-Allow-Origin: *\r\n\r\n"
+            )
+            writer.write(handshake_str.encode("utf-8"))
+            await writer.drain()
 
-                    existing_p = next((p for p in lobby["state"]["players"] if p["id"] == client_id), None)
-                    if not existing_p:
-                        slot_num = len(lobby["state"]["players"])
-                        existing_p = {
-                            "name": pname,
-                            "id": client_id,
-                            "playerNumber": slot_num,
-                            "registered": True,
-                            "color": {"r": 1.0, "g": 1.0, "b": 1.0},
-                            "inGame": lobby["state"]["inProgress"],
-                            "ready": False,
-                            "isServerBot": False,
-                            "coins": 30,
-                            "connected": True
-                        }
-                        lobby["state"]["players"].append(existing_p)
-                    else:
-                        existing_p["connected"] = True
-                        if lobby["state"]["inProgress"]:
-                            existing_p["inGame"] = True
+            parsed_url = urllib.parse.urlparse(path)
+            path_parts = [p for p in parsed_url.path.split('/') if p]
+            current_lobby_id = path_parts[1] if len(path_parts) >= 2 else "PUBLIC"
 
-                    ack_packet = {
-                        "type": "Hello",
-                        "id": client_id,
-                        "name": pname,
-                        "data": str(existing_p["playerNumber"])
-                    }
-                    await send_payload(websocket, json.dumps(ack_packet), recipient_info=f"Player:{client_id}")
-                    should_broadcast_state = True
+            logging.info(f"[+] WS Handshake Complete on lobby: {current_lobby_id}")
 
-                # 2. LOBBY CONFIGURATION
-                elif msg_type in ("SetRoundCount", "LobbyRoundChange"):
-                    if lobby["state"]["inProgress"]:
-                        logging.warning(f"Ignored {msg_type} from {client_id}: Game in progress.")
-                    else:
-                        new_rounds = extract_int(pdata, default=lobby["state"]["roundCount"])
-                        lobby["state"]["roundCount"] = new_rounds
-                        should_broadcast_state = True
-
-                elif msg_type == "Start":
-                    lobby["state"]["inProgress"] = True
-                    lobby["state"]["currentRound"] = 1
-                    for p in lobby["state"]["players"]:
-                        p["inGame"] = True
-                        p["ready"] = False
-                    
-                    should_broadcast_state = True
-                    message_to_relay = message
-
-                # 3. GAMEPLAY & ROUND SYNC
-                elif msg_type == "GameReady":
-                    for p in lobby["state"]["players"]:
-                        if p["id"] in (client_id, pid):
-                            if lobby["state"]["inProgress"]:
-                                p["inGame"] = True
-                    should_broadcast_state = True
-
-                elif msg_type == "ReadyForNextRound":
-                    for p in lobby["state"]["players"]:
-                        if p["id"] in (client_id, pid):
-                            p["ready"] = True
-
-                    # Advance round ONLY when all active players confirm round completion
-                    active_players = [p for p in lobby["state"]["players"] if p.get("connected", True)]
-                    if len(active_players) > 0 and all(p["ready"] for p in active_players):
-                        lobby["state"]["currentRound"] += 1
-                        for p in lobby["state"]["players"]:
-                            p["ready"] = False
-                        round_advanced = True
-
-                    should_broadcast_state = True
-                    message_to_relay = message
-
-                # Handle coin/poker hand state updates explicitly
-                elif msg_type == "UpdatePlayerCoins":
-                    new_coins = extract_int(pdata, default=None)
-                    if new_coins is not None:
-                        for p in lobby["state"]["players"]:
-                            if p["id"] in (client_id, pid):
-                                p["coins"] = new_coins
-                        should_broadcast_state = True
-                    message_to_relay = message
-
-                elif msg_type == "LobbyUpdated":
-                    if isinstance(pdata, dict) and not lobby["state"]["inProgress"]:
-                        lobby["state"].update(pdata)
-                        should_broadcast_state = True
-
-                # 4. DIRECT RELAY (Cards dealt, held, drawn, shown down)
-                else:
-                    message_to_relay = message
-
-            # Execute I/O and broadcasts outside STATE_LOCK
-            if should_broadcast_state:
-                await broadcast_lobby_state(room_id)
-
-            if round_advanced:
-                next_round_event = json.dumps({
-                    "type": "RoundStart",
-                    "round": lobby["state"]["currentRound"]
-                })
-                await broadcast_to_lobby(room_id, next_round_event, exclude_ws=None)
-
-            if message_to_relay:
-                exclude = websocket if exclude_relay_sender else None
-                await broadcast_to_lobby(room_id, message_to_relay, exclude_ws=exclude)
-
-    except (websockets.exceptions.ConnectionClosedOK, websockets.exceptions.ConnectionClosedError):
-        pass
-    finally:
-        async with STATE_LOCK:
-            lobby = LOBBIES.get(current_lobby_id)
-            if lobby and client_id in lobby["clients"]:
-                del lobby["clients"][client_id]
+            while True:
+                frame_header = await read_exact(reader, 2)
+                if not frame_header:
+                    break
                 
-                p_record = next((p for p in lobby["state"]["players"] if p["id"] == client_id), None)
-                if p_record:
-                    p_record["connected"] = False
+                b1, b2 = frame_header[0], frame_header[1]
+                opcode = b1 & 0x0F
+                masked = (b2 & 0x80) != 0
+                payload_len = b2 & 0x7F
 
-                if not lobby["clients"]:
-                    del LOBBIES[current_lobby_id]
-                    logging.info(f"[-] Lobby {current_lobby_id} closed (empty).")
+                if payload_len == 126:
+                    ext_len = await read_exact(reader, 2)
+                    if not ext_len: break
+                    payload_len = int.from_bytes(ext_len, 'big')
+                elif payload_len == 127:
+                    ext_len = await read_exact(reader, 8)
+                    if not ext_len: break
+                    payload_len = int.from_bytes(ext_len, 'big')
+
+                mask_key = await read_exact(reader, 4) if masked else b""
+                if masked and not mask_key: break
+
+                encoded_payload = await read_exact(reader, payload_len) if payload_len > 0 else b""
+                if payload_len > 0 and not encoded_payload: break
+
+                if masked:
+                    decoded_payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(encoded_payload))
                 else:
-                    should_broadcast_state = True
+                    decoded_payload = encoded_payload
 
-        if current_lobby_id in LOBBIES:
-            await broadcast_lobby_state(current_lobby_id)
+                if opcode == 0x8:
+                    break
+                elif opcode == 0x1:
+                    message = decoded_payload.decode('utf-8', errors='ignore')
+                    logging.info(f"[<-- RECV WS] {message}")
 
-        logging.info(f"[-] Client {peer_addr} disconnected.")
+                    try:
+                        packet = json.loads(message)
+                    except Exception:
+                        packet = {}
+
+                    msg_type = packet.get("type")
+                    pid = packet.get("id") or f"Player-{peer_addr[1]}"
+                    pname = packet.get("name") or pid
+                    room_id = packet.get("lobbyId") or packet.get("room") or current_lobby_id
+
+                    broadcast_state = False
+                    relay_msg = True
+
+                    async with STATE_LOCK:
+                        lobby = get_or_create_lobby(room_id)
+                        current_lobby_id = room_id
+
+                        if msg_type in (WSMsgType.Hello, WSMsgType.GameReady):
+                            client_id = pid
+                            lobby["clients"][client_id] = {"writer": writer, "reader": reader}
+                            
+                            if not lobby["state"]["host"]:
+                                lobby["state"]["host"] = client_id
+
+                            existing_p = next((p for p in lobby["state"]["players"] if p["id"] == client_id), None)
+                            if not existing_p:
+                                slot_num = len(lobby["state"]["players"])
+                                lobby["state"]["players"].append({
+                                    "name": pname,
+                                    "id": client_id,
+                                    "playerNumber": slot_num,
+                                    "registered": True,
+                                    "color": {"r": 1.0, "g": 1.0, "b": 1.0},
+                                    "inGame": lobby["state"]["inProgress"],
+                                    "ready": True,
+                                    "isServerBot": False,
+                                    "coins": 100,
+                                    "connected": True
+                                })
+                            else:
+                                existing_p["connected"] = True
+                                existing_p["name"] = pname
+                                
+                            broadcast_state = True
+                            relay_msg = False
+
+                        elif msg_type in (WSMsgType.SetRoundCount, WSMsgType.LobbyRoundChange):
+                            if "data" in packet:
+                                lobby["state"]["roundCount"] = packet["data"]
+
+                        elif msg_type == WSMsgType.SetTimer:
+                            if "data" in packet:
+                                lobby["state"]["useTimer"] = packet["data"]
+
+                    if broadcast_state:
+                        await broadcast_lobby_state(room_id)
+
+                    if relay_msg:
+                        await broadcast_to_lobby(room_id, message, exclude_writer=writer)
+
+    except Exception as err:
+        logging.error(f"[!] Error handling client {peer_addr}: {err}")
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        logging.info(f"[-] Connection closed: {peer_addr}")
 
 
 async def main():
-    logging.info("========================================")
-    logging.info(f" HYBRID P2P / ROUND SYNC SERVER ACTIVE")
-    logging.info(f" Listening on: ws://{HOST_IP}:{PORT}")
-    logging.info("========================================")
-
-    async with websockets.serve(
-        handle_game_client,
-        HOST_IP,
-        PORT,
-        ping_interval=20,
-        ping_timeout=10
-    ):
-        await asyncio.Future()
+    server = await asyncio.start_server(handle_client, HOST_IP, PORT)
+    logging.info(f"[*] Server listening on {HOST_IP}:{PORT}")
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
