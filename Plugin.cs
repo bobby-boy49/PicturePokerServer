@@ -27,7 +27,7 @@ namespace PicturePokerRedirector
                 "Server Settings",
                 "ServerHost",
                 DEFAULT_SERVER_HOST,
-                "The target server host/IP address (e.g. 127.0.0.1:4444 or myserver.com)."
+                "The target server host/IP address (e.g. 192.168.1.50:4444 or myserver.com)."
             );
 
             inputServerHost = TargetServerHost.Value;
@@ -65,7 +65,7 @@ namespace PicturePokerRedirector
         {
             GUILayout.Space(5);
             
-            // Custom Styling for Larger Text/Fields (using standard GUI styles without FontStyle)
+            // Custom Styling for Larger Text/Fields
             GUIStyle labelStyle = new GUIStyle(GUI.skin.label) { fontSize = 14 };
             GUIStyle fieldStyle = new GUIStyle(GUI.skin.textField) { fontSize = 14, fixedHeight = 28 };
             GUIStyle buttonStyle = new GUIStyle(GUI.skin.button) { fontSize = 13, fixedHeight = 35 };
@@ -131,7 +131,14 @@ namespace PicturePokerRedirector
         public static string GetFormattedWsUrl()
         {
             string host = CleanHostInput(TargetServerHost.Value);
-            bool isLocal = host.StartsWith("127.0.0.1") || host.StartsWith("localhost") || host.StartsWith("192.168.");
+            
+            // Support all common local network address blocks and loopbacks
+            bool isLocal = host.StartsWith("127.0.0.1") || 
+                           host.StartsWith("localhost") || 
+                           host.StartsWith("192.168.") || 
+                           host.StartsWith("10.") || 
+                           host.StartsWith("172.");
+
             string scheme = isLocal ? "ws://" : "wss://";
             return $"{scheme}{host}/";
         }
@@ -139,7 +146,13 @@ namespace PicturePokerRedirector
         public static string GetFormattedHttpUrl()
         {
             string host = CleanHostInput(TargetServerHost.Value);
-            bool isLocal = host.StartsWith("127.0.0.1") || host.StartsWith("localhost") || host.StartsWith("192.168.");
+            
+            bool isLocal = host.StartsWith("127.0.0.1") || 
+                           host.StartsWith("localhost") || 
+                           host.StartsWith("192.168.") || 
+                           host.StartsWith("10.") || 
+                           host.StartsWith("172.");
+
             string scheme = isLocal ? "http://" : "https://";
             return $"{scheme}{host}/";
         }
