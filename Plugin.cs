@@ -9,44 +9,33 @@ namespace PicturePokerRedirector
     [BepInPlugin("com.yourname.picturepoker.redirector", "Picture Poker Server Redirector", "1.0.0")]
     public class Plugin : BaseUnityPlugin
     {
-        // Hardcoded original production server addresses
-        public const string DEFAULT_WS_URL = "wss://picturepoker.rui2015.me/";
-        public const string DEFAULT_HTTP_URL = "https://picturepoker.rui2015.me/";
+        // Default host/IP address
+        public const string DEFAULT_SERVER_HOST = "picturepoker.rui2015.me";
 
-        public static ConfigEntry<string> TargetWsUrl;
-        public static ConfigEntry<string> TargetHttpUrl;
+        public static ConfigEntry<string> TargetServerHost;
 
         // UI state
         private bool showUi = false;
-        private string inputWsUrl = "";
-        private string inputHttpUrl = "";
-        private Rect windowRect = new Rect(20, 20, 400, 210);
+        private string inputServerHost = "";
+        private Rect windowRect = new Rect(20, 20, 380, 160);
 
         private void Awake()
         {
-            // Bind config with hardcoded defaults
-            TargetWsUrl = Config.Bind(
+            // Bind config with a single target host address
+            TargetServerHost = Config.Bind(
                 "Server Settings",
-                "ServerWSUrl",
-                DEFAULT_WS_URL,
-                "The target WebSocket URL for multiplayer traffic."
+                "ServerHost",
+                DEFAULT_SERVER_HOST,
+                "The target server host/IP address (e.g. 127.0.0.1:4444 or myserver.com)."
             );
 
-            TargetHttpUrl = Config.Bind(
-                "Server Settings",
-                "ServerHttpUrl",
-                DEFAULT_HTTP_URL,
-                "The target HTTP URL for API traffic."
-            );
-
-            // Sync UI input fields
-            inputWsUrl = TargetWsUrl.Value;
-            inputHttpUrl = TargetHttpUrl.Value;
+            // Sync UI input field
+            inputServerHost = TargetServerHost.Value;
 
             Harmony harmony = new Harmony("com.yourname.picturepoker.redirector");
             harmony.PatchAll();
 
-            Logger.LogInfo("[Redirector Mod] Active! Hardcoded defaults set. Press F2 to open Server Switcher.");
+            Logger.LogInfo("[Redirector Mod] Active! Press F2 to open Server Switcher.");
         }
 
         private void Update()
@@ -66,42 +55,32 @@ namespace PicturePokerRedirector
 
         private void DrawServerWindow(int windowID)
         {
-            GUILayout.Label("WebSocket URL:");
-            inputWsUrl = GUILayout.TextField(inputWsUrl);
-
-            GUILayout.Space(5);
-
-            GUILayout.Label("HTTP API URL:");
-            inputHttpUrl = GUILayout.TextField(inputHttpUrl);
+            GUILayout.Label("Server Address (IP:Port or Domain):");
+            inputServerHost = GUILayout.TextField(inputServerHost);
 
             GUILayout.Space(10);
 
             GUILayout.BeginHorizontal();
 
-            // Apply custom server typed in UI
+            // Apply custom server address typed in UI
             if (GUILayout.Button("Apply & Redirect"))
             {
-                if (!inputWsUrl.EndsWith("/")) inputWsUrl += "/";
-                if (!inputHttpUrl.EndsWith("/")) inputHttpUrl += "/";
-
-                TargetWsUrl.Value = inputWsUrl;
-                TargetHttpUrl.Value = inputHttpUrl;
+                string cleaned = CleanHostInput(inputServerHost);
+                inputServerHost = cleaned;
+                TargetServerHost.Value = cleaned;
 
                 Config.Save();
-                Logger.LogInfo($"[Redirector Mod] Server redirected -> WS: {TargetWsUrl.Value} | HTTP: {TargetHttpUrl.Value}");
+                Logger.LogInfo($"[Redirector Mod] Server redirected -> Host: {TargetServerHost.Value}");
             }
 
-            // Reset back to hardcoded defaults
+            // Reset back to default
             if (GUILayout.Button("Reset to Default"))
             {
-                inputWsUrl = DEFAULT_WS_URL;
-                inputHttpUrl = DEFAULT_HTTP_URL;
-
-                TargetWsUrl.Value = DEFAULT_WS_URL;
-                TargetHttpUrl.Value = DEFAULT_HTTP_URL;
+                inputServerHost = DEFAULT_SERVER_HOST;
+                TargetServerHost.Value = DEFAULT_SERVER_HOST;
 
                 Config.Save();
-                Logger.LogInfo("[Redirector Mod] Server reset to official production defaults.");
+                Logger.LogInfo("[Redirector Mod] Server reset to default address.");
             }
 
             GUILayout.EndHorizontal();
@@ -115,6 +94,37 @@ namespace PicturePokerRedirector
 
             GUI.DragWindow();
         }
+
+        // Strips protocol prefixes/slashes if user enters http(s):// or ws(s)://
+        public static string CleanHostInput(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return DEFAULT_SERVER_HOST;
+
+            host = host.Trim();
+            if (host.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(8);
+            else if (host.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(7);
+            else if (host.StartsWith("wss://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(6);
+            else if (host.StartsWith("ws://", StringComparison.OrdinalIgnoreCase)) host = host.Substring(5);
+
+            return host.TrimEnd('/');
+        }
+
+        // Helper methods to construct formatted URLs
+        public static string GetFormattedWsUrl()
+        {
+            string host = CleanHostInput(TargetServerHost.Value);
+            bool isLocal = host.StartsWith("127.0.0.1") || host.StartsWith("localhost") || host.StartsWith("192.168.");
+            string scheme = isLocal ? "ws://" : "wss://";
+            return $"{scheme}{host}/";
+        }
+
+        public static string GetFormattedHttpUrl()
+        {
+            string host = CleanHostInput(TargetServerHost.Value);
+            bool isLocal = host.StartsWith("127.0.0.1") || host.StartsWith("localhost") || host.StartsWith("192.168.");
+            string scheme = isLocal ? "http://" : "https://";
+            return $"{scheme}{host}/";
+        }
     }
 
     // Intercept WebSocket URL Getter
@@ -123,9 +133,7 @@ namespace PicturePokerRedirector
     {
         public static void Postfix(ref string __result)
         {
-            string customUrl = Plugin.TargetWsUrl.Value;
-            if (!customUrl.EndsWith("/")) customUrl += "/";
-            __result = customUrl;
+            __result = Plugin.GetFormattedWsUrl();
         }
     }
 
@@ -135,9 +143,7 @@ namespace PicturePokerRedirector
     {
         public static void Postfix(ref string __result)
         {
-            string customUrl = Plugin.TargetHttpUrl.Value;
-            if (!customUrl.EndsWith("/")) customUrl += "/";
-            __result = customUrl;
+            __result = Plugin.GetFormattedHttpUrl();
         }
     }
 
@@ -156,8 +162,8 @@ namespace PicturePokerRedirector
                 savedWs = GameSettings.instance.serverWSUrl;
 
                 // Always write official defaults to settings.json
-                GameSettings.instance.serverHttpUrl = Plugin.DEFAULT_HTTP_URL;
-                GameSettings.instance.serverWSUrl = Plugin.DEFAULT_WS_URL;
+                GameSettings.instance.serverHttpUrl = $"https://{Plugin.DEFAULT_SERVER_HOST}/";
+                GameSettings.instance.serverWSUrl = $"wss://{Plugin.DEFAULT_SERVER_HOST}/";
             }
         }
 
