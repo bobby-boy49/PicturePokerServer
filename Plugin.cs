@@ -14,14 +14,15 @@ namespace PicturePokerRedirector
 
         public static ConfigEntry<string> TargetServerHost;
 
-        // UI state
+        // UI state & Window Sizing
         private bool showUi = false;
         private string inputServerHost = "";
-        private Rect windowRect = new Rect(20, 20, 380, 160);
+        
+        // Initial window dimensions (Width: 500px, Height: 260px)
+        private Rect windowRect = new Rect(30, 30, 500, 260);
 
         private void Awake()
         {
-            // Bind config with a single target host address
             TargetServerHost = Config.Bind(
                 "Server Settings",
                 "ServerHost",
@@ -29,7 +30,6 @@ namespace PicturePokerRedirector
                 "The target server host/IP address (e.g. 127.0.0.1:4444 or myserver.com)."
             );
 
-            // Sync UI input field
             inputServerHost = TargetServerHost.Value;
 
             Harmony harmony = new Harmony("com.yourname.picturepoker.redirector");
@@ -50,20 +50,40 @@ namespace PicturePokerRedirector
         {
             if (!showUi) return;
 
+            // Clamp window size so it never exceeds screen resolution or shrinks below minimums
+            windowRect.width = Mathf.Clamp(windowRect.width, 350f, Screen.width);
+            windowRect.height = Mathf.Clamp(windowRect.height, 220f, Screen.height);
+
+            // Clamp window position inside game screen bounds
+            windowRect.x = Mathf.Clamp(windowRect.x, 0f, Screen.width - windowRect.width);
+            windowRect.y = Mathf.Clamp(windowRect.y, 0f, Screen.height - windowRect.height);
+
             windowRect = GUILayout.Window(999123, windowRect, DrawServerWindow, "Server Switcher (F2 to Toggle)");
         }
 
         private void DrawServerWindow(int windowID)
         {
-            GUILayout.Label("Server Address (IP:Port or Domain):");
-            inputServerHost = GUILayout.TextField(inputServerHost);
+            GUILayout.Space(5);
+            
+            // Custom Styling for Larger Text/Fields (using standard GUI styles without FontStyle)
+            GUIStyle labelStyle = new GUIStyle(GUI.skin.label) { fontSize = 14 };
+            GUIStyle fieldStyle = new GUIStyle(GUI.skin.textField) { fontSize = 14, fixedHeight = 28 };
+            GUIStyle buttonStyle = new GUIStyle(GUI.skin.button) { fontSize = 13, fixedHeight = 35 };
 
-            GUILayout.Space(10);
+            GUILayout.Label("Server Address (IP:Port or Domain):", labelStyle);
+            inputServerHost = GUILayout.TextField(inputServerHost, fieldStyle);
+
+            GUILayout.Space(15);
+
+            // Display current active URLs for clarity
+            GUILayout.Label($"<b>WS:</b> {GetFormattedWsUrl()}", GUI.skin.label);
+            GUILayout.Label($"<b>HTTP:</b> {GetFormattedHttpUrl()}", GUI.skin.label);
+
+            GUILayout.FlexibleSpace();
 
             GUILayout.BeginHorizontal();
 
-            // Apply custom server address typed in UI
-            if (GUILayout.Button("Apply & Redirect"))
+            if (GUILayout.Button("Apply & Redirect", buttonStyle))
             {
                 string cleaned = CleanHostInput(inputServerHost);
                 inputServerHost = cleaned;
@@ -73,8 +93,7 @@ namespace PicturePokerRedirector
                 Logger.LogInfo($"[Redirector Mod] Server redirected -> Host: {TargetServerHost.Value}");
             }
 
-            // Reset back to default
-            if (GUILayout.Button("Reset to Default"))
+            if (GUILayout.Button("Reset Default", buttonStyle))
             {
                 inputServerHost = DEFAULT_SERVER_HOST;
                 TargetServerHost.Value = DEFAULT_SERVER_HOST;
@@ -87,15 +106,15 @@ namespace PicturePokerRedirector
 
             GUILayout.Space(5);
 
-            if (GUILayout.Button("Close Menu"))
+            if (GUILayout.Button("Close Menu", buttonStyle))
             {
                 showUi = false;
             }
 
+            // Allow dragging from anywhere in the window
             GUI.DragWindow();
         }
 
-        // Strips protocol prefixes/slashes if user enters http(s):// or ws(s)://
         public static string CleanHostInput(string host)
         {
             if (string.IsNullOrEmpty(host)) return DEFAULT_SERVER_HOST;
@@ -109,7 +128,6 @@ namespace PicturePokerRedirector
             return host.TrimEnd('/');
         }
 
-        // Helper methods to construct formatted URLs
         public static string GetFormattedWsUrl()
         {
             string host = CleanHostInput(TargetServerHost.Value);
@@ -161,7 +179,6 @@ namespace PicturePokerRedirector
                 savedHttp = GameSettings.instance.serverHttpUrl;
                 savedWs = GameSettings.instance.serverWSUrl;
 
-                // Always write official defaults to settings.json
                 GameSettings.instance.serverHttpUrl = $"https://{Plugin.DEFAULT_SERVER_HOST}/";
                 GameSettings.instance.serverWSUrl = $"wss://{Plugin.DEFAULT_SERVER_HOST}/";
             }
