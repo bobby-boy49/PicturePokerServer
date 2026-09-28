@@ -19,29 +19,22 @@ class ConsoleColorFormatter(logging.Formatter):
     def format(self, record):
         record.asctime = self.formatTime(record, "%H:%M:%S")
         msg = record.getMessage()
-        
         if IS_IDLE:
             return f"{record.asctime} [{record.levelname}] {msg}"
-        
         color = self.GREEN if "[SEND]" in msg else (self.CYAN if "[RECV]" in msg else self.RESET)
         return f"{color}{record.asctime} [{record.levelname}] {msg}{self.RESET}"
 
-
 logger = logging.getLogger("RoomServer")
 logger.setLevel(logging.INFO)
-
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(ConsoleColorFormatter())
 logger.addHandler(stream_handler)
 
 HOST_IP = "0.0.0.0"
 PORT = 4444
-
 LOBBIES = {}
-LAST_CREATED_LOBBY = "PUBLIC"
 STATE_LOCK = asyncio.Lock()
 DEFAULT_ROUND_TIME = 15
-
 
 class WSMsgType:
     MyCards = "MyCards"
@@ -60,7 +53,6 @@ class WSMsgType:
     LobbyRoundChange = "LobbyRoundChange"
     SetTimer = "SetTimer"
 
-
 def log_packet(direction, peer, raw_text, room_id):
     try:
         parsed = json.loads(raw_text)
@@ -70,34 +62,25 @@ def log_packet(direction, peer, raw_text, room_id):
     except Exception:
         logger.info(f"[{direction}] [{peer}] [Room: {room_id}] RAW -> {raw_text}")
 
-
 def get_now_iso():
     return datetime.now(timezone.utc).isoformat()
-
 
 def extract_room_id_from_path(path):
     parsed_url = urllib.parse.urlparse(path)
     query_params = urllib.parse.parse_qs(parsed_url.query)
-    
     for key in ("room", "code", "lobbyId", "lobby_id", "roomId", "room_id"):
         if key in query_params:
             return query_params[key][0].upper().strip()
-
     path_parts = [p.strip().upper() for p in parsed_url.path.split('/') if p.strip()]
-    ignored_keywords = {"WS", "WEBSOCKET", "LOBBY", "LOBBIES", "JOIN", "API", "CREATELOBBY", "PUBLICLOBBY"}
-    
-    filtered_parts = [p for p in path_parts if p not in ignored_keywords]
-    if filtered_parts:
-        candidate = filtered_parts[-1]
-        if 3 <= len(candidate) <= 8:
-            return candidate
-        
-    return None
-
+    ignored = {"WS", "WEBSOCKET", "LOBBY", "LOBBIES", "JOIN", "API", "CREATELOBBY", "PUBLICLOBBY", "JOINLOBBY"}
+    filtered = [p for p in path_parts if p not in ignored]
+    return filtered[-1] if filtered and 3 <= len(filtered[-1]) <= 8 else None
 
 def generate_room_code():
-    return "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=4))
-
+    while True:
+        code = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=4))
+        if code not in LOBBIES and code != "PUBLIC":
+            return code
 
 def get_or_create_lobby(lobby_id):
     lobby_id = lobby_id.strip().upper() if lobby_id else "PUBLIC"
@@ -130,11 +113,9 @@ def get_or_create_lobby(lobby_id):
             },
             "clients": {},
             "round_ready": set(),
-            "timer_task": None,
-            "timer_remaining": DEFAULT_ROUND_TIME
+            "player_rounds": {}
         }
     return LOBBIES[lobby_id]
-
 
 async def read_exact(reader, num_bytes):
     data = b""
@@ -146,7 +127,6 @@ async def read_exact(reader, num_bytes):
         except Exception:
             return None
     return data
-
 
 async def send_ws_frame(writer, payload_str, opcode=0x2, room_id="N/A"):
     try:
@@ -172,7 +152,6 @@ async def send_ws_frame(writer, payload_str, opcode=0x2, room_id="N/A"):
     except Exception:
         pass
 
-
 async def close_ws_connection(writer):
     try:
         writer.write(bytearray([0x88, 0x00]))
@@ -186,7 +165,6 @@ async def close_ws_connection(writer):
         except Exception:
             pass
 
-
 async def broadcast_to_lobby(lobby_id, message, exclude_writer=None):
     lobby = LOBBIES.get(lobby_id)
     if not lobby: return
@@ -194,12 +172,21 @@ async def broadcast_to_lobby(lobby_id, message, exclude_writer=None):
         if client_info["writer"] != exclude_writer:
             await send_ws_frame(client_info["writer"], message, room_id=lobby_id)
 
-
 async def broadcast_lobby_state(room_id, target_writer=None):
     lobby = LOBBIES.get(room_id)
     if not lobby: return
     
+    cur = lobby["state"].get("currentRound", 1)
+    tot = lobby["state"].get("roundCount", 5)
+    
+    if lobby["state"].get("inProgress", False):
+        lobby["state"]["roundsRemaining"] = max(0, tot - cur + 1)
+    else:
+        lobby["state"]["currentRound"] = 1
+        lobby["state"]["roundsRemaining"] = tot
+        
     lobby["state"]["lastActivity"] = get_now_iso()
+
     payload_str = json.dumps({
         "type": WSMsgType.LobbyUpdated,
         "player": "System",
@@ -221,107 +208,12 @@ async def broadcast_lobby_state(room_id, target_writer=None):
         await send_ws_frame(target_writer, payload_str, room_id=room_id)
     else:
         for cid, client_info in list(lobby["clients"].items()):
-            await send_ws_frame(client_info["writer"], payload_str, room_id=room_id)
-
-
-def stop_timer(lobby):
-    if lobby["timer_task"] and not lobby["timer_task"].done():
-        lobby["timer_task"].cancel()
-    lobby["timer_task"] = None
-
-
-def start_timer_if_enabled(lobby, room_id):
-    stop_timer(lobby)
-    if not lobby["state"]["useTimer"]:
-        return
-
-    lobby["timer_remaining"] = DEFAULT_ROUND_TIME
-
-    async def timer_loop():
-        try:
-            while lobby["timer_remaining"] > 0:
-                await asyncio.sleep(1)
-                async with STATE_LOCK:
-                    if not lobby["state"]["useTimer"]:
-                        break
-                    
-                    lobby["timer_remaining"] -= 1
-                    tick_packet = json.dumps({
-                        "type": "TimerTick",
-                        "player": "System",
-                        "id": "System",
-                        "playerId": "System",
-                        "lobbyId": room_id,
-                        "data": lobby["timer_remaining"]
-                    })
-                    for cid, client_info in list(lobby["clients"].items()):
-                        await send_ws_frame(client_info["writer"], tick_packet, room_id=room_id)
-
-        except asyncio.CancelledError:
-            pass
-
-    lobby["timer_task"] = asyncio.create_task(timer_loop())
-
-
-async def send_round_start(lobby, room_id):
-    total_rounds = lobby["state"]["roundCount"]
-    current_round = lobby["state"]["currentRound"]
-    lobby["state"]["roundsRemaining"] = max(0, total_rounds - current_round)
-    lobby["round_ready"].clear()
-    
-    game_started_payload = json.dumps({
-        "type": "GameStarted",
-        "player": "System",
-        "id": "System",
-        "playerId": "System",
-        "lobbyId": room_id,
-        "data": {
-            "currentRound": current_round,
-            "roundCount": total_rounds,
-            "roundsRemaining": lobby["state"]["roundsRemaining"]
-        }
-    })
-    
-    # Broadcast GameStarted to ALL active clients
-    for cid, client_info in list(lobby["clients"].items()):
-        await send_ws_frame(client_info["writer"], game_started_payload, room_id=room_id)
-        
-    start_timer_if_enabled(lobby, room_id)
-
-
-async def advance_round(lobby, room_id):
-    lobby["round_ready"].clear()
-    lobby["state"]["inProgress"] = True
-    lobby["state"]["phase"] = "GAME"
-    
-    lobby["state"]["currentRound"] += 1
-    total_rounds = lobby["state"]["roundCount"]
-    
-    if lobby["state"]["currentRound"] > total_rounds:
-        lobby["state"]["inProgress"] = False
-        lobby["state"]["phase"] = "LOBBY"
-        lobby["state"]["currentRound"] = 1
-        lobby["state"]["roundsRemaining"] = total_rounds
-        stop_timer(lobby)
-        await broadcast_lobby_state(room_id)
-        
-        await broadcast_to_lobby(room_id, json.dumps({
-            "type": "GameEnded",
-            "player": "System",
-            "id": "System",
-            "playerId": "System",
-            "lobbyId": room_id,
-            "data": {
-                "message": "Match complete",
-                "totalRounds": total_rounds
-            }
-        }))
-    else:
-        await send_round_start(lobby, room_id)
-
+            try:
+                await send_ws_frame(client_info["writer"], payload_str, room_id=room_id)
+            except Exception:
+                pass
 
 async def handle_client(reader, writer):
-    global LAST_CREATED_LOBBY
     peer_addr = writer.get_extra_info('peername')
     current_lobby_id = "PUBLIC"
     client_id = None
@@ -352,10 +244,18 @@ async def handle_client(reader, writer):
             for line in lines[1:] if ":" in line
         }
 
+        # Menu HTTP Endpoints
         if method in ("GET", "POST") and any(ep in clean_path for ep in ["createlobby", "publiclobby", "joinlobby"]):
-            room_code = "PUBLIC" if "public" in clean_path else generate_room_code()
+            extracted = extract_room_id_from_path(path)
+            
+            if "createlobby" in clean_path:
+                room_code = generate_room_code()
+            elif "joinlobby" in clean_path:
+                room_code = extracted if extracted and extracted in LOBBIES else "PUBLIC"
+            else:
+                room_code = "PUBLIC"
+
             lobby = get_or_create_lobby(room_code)
-            LAST_CREATED_LOBBY = room_code
 
             response_payload = json.dumps({
                 "lobbyToUse": room_code,
@@ -374,6 +274,7 @@ async def handle_client(reader, writer):
             await writer.wait_closed()
             return
 
+        # WebSocket Connection
         if headers.get("upgrade", "").lower() == "websocket":
             ws_key = headers.get("sec-websocket-key", "")
             ws_accept = base64.b64encode(hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("utf-8")).digest()).decode("utf-8")
@@ -381,7 +282,7 @@ async def handle_client(reader, writer):
             await writer.drain()
 
             extracted_id = extract_room_id_from_path(path)
-            current_lobby_id = extracted_id if extracted_id else LAST_CREATED_LOBBY
+            current_lobby_id = extracted_id if extracted_id else "PUBLIC"
 
             while True:
                 frame_header = await read_exact(reader, 2)
@@ -443,7 +344,6 @@ async def handle_client(reader, writer):
 
                         if msg_type in (WSMsgType.Hello, WSMsgType.GameReady, "PlayerReady", "Join"):
                             handled = True
-                            # Lock host to the first player who joins or creates
                             if not lobby["state"]["host"]:
                                 lobby["state"]["host"] = client_id
 
@@ -477,39 +377,36 @@ async def handle_client(reader, writer):
                             lobby["state"]["inProgress"] = True
                             lobby["state"]["phase"] = "GAME"
                             lobby["state"]["currentRound"] = 1
-                            await send_round_start(lobby, room_id)
-
-                        elif msg_type == WSMsgType.ReadyForNextRound or msg_type in ("RoundComplete", "NextRound"):
-                            handled = True
-                            await advance_round(lobby, room_id)
+                            lobby["state"]["roundsRemaining"] = lobby["state"]["roundCount"]
+                            await broadcast_lobby_state(room_id)
 
                         elif msg_type in (WSMsgType.SetRoundCount, WSMsgType.LobbyRoundChange, "UpdateRoundCount"):
                             handled = True
                             if "data" in packet:
                                 try:
-                                    rounds = int(packet["data"])
-                                    if rounds > 0:
-                                        lobby["state"]["roundCount"] = rounds
-                                        lobby["state"]["roundsRemaining"] = rounds
+                                    val = int(packet["data"])
+                                    if val > 0:
+                                        if lobby["state"]["inProgress"]:
+                                            lobby["state"]["currentRound"] = val
+                                        else:
+                                            lobby["state"]["roundCount"] = val
+                                            lobby["state"]["roundsRemaining"] = val
+                                        
+                                        # Force official state update to all clients
                                         await broadcast_lobby_state(room_id)
                                 except (ValueError, TypeError):
                                     pass
 
                         elif msg_type in (WSMsgType.SetTimer, "ToggleTimer"):
                             handled = True
-                            use_timer = bool(packet["data"]) if "data" in packet else not lobby["state"]["useTimer"]
-                            lobby["state"]["useTimer"] = use_timer
-                            
-                            if not lobby["state"]["useTimer"]:
-                                stop_timer(lobby)
-                            elif lobby["state"]["inProgress"]:
-                                start_timer_if_enabled(lobby, room_id)
-                                
-                            await broadcast_lobby_state(room_id)
+                            if not lobby["state"]["inProgress"]:
+                                use_timer = bool(packet["data"]) if "data" in packet else not lobby["state"]["useTimer"]
+                                lobby["state"]["useTimer"] = use_timer
+                                await broadcast_lobby_state(room_id)
 
                         elif msg_type == WSMsgType.LobbyBetChange:
                             handled = True
-                            if "data" in packet:
+                            if not lobby["state"]["inProgress"] and "data" in packet:
                                 lobby["state"]["betMultiplier"] = packet["data"]
                                 await broadcast_lobby_state(room_id)
 
@@ -529,7 +426,6 @@ async def handle_client(reader, writer):
         async with STATE_LOCK:
             lobby = LOBBIES.get(current_lobby_id)
             if lobby and client_id:
-                # Do not immediately reassign host if player disconnects during active gameplay/reconnection
                 if client_id in lobby["clients"] and lobby["clients"][client_id]["writer"] == writer:
                     del lobby["clients"][client_id]
                 
@@ -537,20 +433,15 @@ async def handle_client(reader, writer):
                 if p_record:
                     p_record["connected"] = False
 
-                if not any(p.get("connected") for p in lobby["state"]["players"]):
-                    stop_timer(lobby)
-
                 await broadcast_lobby_state(current_lobby_id)
 
         await close_ws_connection(writer)
-
 
 async def main():
     server = await asyncio.start_server(handle_client, HOST_IP, PORT)
     logger.info(f"[SERVER] Room & Menu server active on ws://{HOST_IP}:{PORT}")
     async with server:
         await server.serve_forever()
-
 
 if __name__ == "__main__":
     try:
