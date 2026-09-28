@@ -1,8 +1,9 @@
 using BepInEx;
 using BepInEx.Configuration;
-using HarmonyLib;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
-using System.Text.RegularExpressions;
+using System.IO;
 using UnityEngine;
 
 namespace PicturePokerRedirector
@@ -32,9 +33,6 @@ namespace PicturePokerRedirector
             );
 
             inputServerHost = TargetServerHost.Value;
-
-            Harmony harmony = new Harmony("com.yourname.picturepoker.redirector");
-            harmony.PatchAll();
 
             Logger.LogInfo("[Redirector Mod] Active! Press F2 to open Server Switcher.");
         }
@@ -76,9 +74,10 @@ namespace PicturePokerRedirector
 
             GUILayout.Space(15);
 
-            // Display current active URLs for clarity
-            GUILayout.Label($"<b>WS:</b> {GetFormattedWsUrl()}", GUI.skin.label);
-            GUILayout.Label($"<b>HTTP:</b> {GetFormattedHttpUrl()}", GUI.skin.label);
+            // Display formatted URLs based on current input
+            string previewHost = CleanHostInput(inputServerHost);
+            GUILayout.Label($"<b>WS:</b> {GetFormattedWsUrl(previewHost)}", GUI.skin.label);
+            GUILayout.Label($"<b>HTTP:</b> {GetFormattedHttpUrl(previewHost)}", GUI.skin.label);
 
             GUILayout.FlexibleSpace();
 
@@ -91,7 +90,8 @@ namespace PicturePokerRedirector
                 TargetServerHost.Value = cleaned;
 
                 Config.Save();
-                Logger.LogInfo($"[Redirector Mod] Server redirected -> Host: {TargetServerHost.Value}");
+                WriteHostToDisk(cleaned);
+                Logger.LogInfo($"[Redirector Mod] Server written to settings.json -> Host: {TargetServerHost.Value}");
             }
 
             if (GUILayout.Button("Reset Default", buttonStyle))
@@ -100,7 +100,8 @@ namespace PicturePokerRedirector
                 TargetServerHost.Value = DEFAULT_SERVER_HOST;
 
                 Config.Save();
-                Logger.LogInfo("[Redirector Mod] Server reset to default address.");
+                WriteHostToDisk(DEFAULT_SERVER_HOST);
+                Logger.LogInfo("[Redirector Mod] Server reset to default address in settings.json.");
             }
 
             GUILayout.EndHorizontal();
@@ -114,6 +115,45 @@ namespace PicturePokerRedirector
 
             // Allow dragging from anywhere in the window
             GUI.DragWindow();
+        }
+
+        /// <summary>
+        /// Writes the target host URLs directly into settings.json on disk using Newtonsoft.Json.
+        /// </summary>
+        private void WriteHostToDisk(string host)
+        {
+            try
+            {
+                string settingsPath = GameSettings.settingsJsonPath;
+
+                if (!File.Exists(settingsPath))
+                {
+                    Logger.LogWarning($"[Redirector Mod] settings.json missing at {settingsPath}. Skipping write.");
+                    return;
+                }
+
+                string rawJson = File.ReadAllText(settingsPath);
+                JObject settings = JObject.Parse(rawJson);
+
+                string formattedWs = GetFormattedWsUrl(host);
+                string formattedHttp = GetFormattedHttpUrl(host);
+
+                settings["serverWSUrl"] = formattedWs;
+                settings["serverHttpUrl"] = formattedHttp;
+
+                File.WriteAllText(settingsPath, JsonConvert.SerializeObject(settings, Formatting.Indented));
+
+                // Update in-memory GameSettings object so current session picks it up
+                if (GameSettings.instance != null)
+                {
+                    GameSettings.instance.serverWSUrl = formattedWs;
+                    GameSettings.instance.serverHttpUrl = formattedHttp;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError($"[Redirector Mod] Failed to write settings.json: {ex.Message}");
+            }
         }
 
         public static string CleanHostInput(string host)
@@ -160,67 +200,18 @@ namespace PicturePokerRedirector
             return false;
         }
 
-        public static string GetFormattedWsUrl()
+        public static string GetFormattedWsUrl(string host)
         {
-            string host = CleanHostInput(TargetServerHost.Value);
-            string scheme = IsLocalHost(host) ? "ws://" : "wss://";
-            return $"{scheme}{host}/";
+            string cleaned = CleanHostInput(host);
+            string scheme = IsLocalHost(cleaned) ? "ws://" : "wss://";
+            return $"{scheme}{cleaned}/";
         }
 
-        public static string GetFormattedHttpUrl()
+        public static string GetFormattedHttpUrl(string host)
         {
-            string host = CleanHostInput(TargetServerHost.Value);
-            string scheme = IsLocalHost(host) ? "http://" : "https://";
-            return $"{scheme}{host}/";
-        }
-    }
-
-    // Intercept WebSocket URL Getter
-    [HarmonyPatch(typeof(GameSettings), "serverWSUrl", MethodType.Getter)]
-    public static class ServerWsUrlGetterPatch
-    {
-        public static void Postfix(ref string __result)
-        {
-            __result = Plugin.GetFormattedWsUrl();
-        }
-    }
-
-    // Intercept HTTP URL Getter
-    [HarmonyPatch(typeof(GameSettings), "serverHttpUrl", MethodType.Getter)]
-    public static class ServerHttpUrlGetterPatch
-    {
-        public static void Postfix(ref string __result)
-        {
-            __result = Plugin.GetFormattedHttpUrl();
-        }
-    }
-
-    // Prevent redirected URLs from polluting settings.json on disk
-    [HarmonyPatch(typeof(GameSettings), "Save")]
-    public static class GameSettingsSavePatch
-    {
-        private static string savedHttp;
-        private static string savedWs;
-
-        public static void Prefix()
-        {
-            if (GameSettings.instance != null)
-            {
-                savedHttp = GameSettings.instance.serverHttpUrl;
-                savedWs = GameSettings.instance.serverWSUrl;
-
-                GameSettings.instance.serverHttpUrl = $"https://{Plugin.DEFAULT_SERVER_HOST}/";
-                GameSettings.instance.serverWSUrl = $"wss://{Plugin.DEFAULT_SERVER_HOST}/";
-            }
-        }
-
-        public static void Postfix()
-        {
-            if (GameSettings.instance != null)
-            {
-                GameSettings.instance.serverHttpUrl = savedHttp;
-                GameSettings.instance.serverWSUrl = savedWs;
-            }
+            string cleaned = CleanHostInput(host);
+            string scheme = IsLocalHost(cleaned) ? "http://" : "https://";
+            return $"{scheme}{cleaned}/";
         }
     }
 }

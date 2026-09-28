@@ -16,6 +16,10 @@
       <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\BepInEx\core\0Harmony.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\Picture Poker_Data\Managed\Newtonsoft.Json.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
 
     <!-- Game Code Assembly -->
     <Reference Include="Assembly-CSharp">
@@ -33,7 +37,7 @@
       <Private>False</Private>
     </Reference>
 
-    <!-- Unity UI & Input Modules (Fixes CS0103 for Input/GUI/GUILayout) -->
+    <!-- Unity UI & Input Modules -->
     <Reference Include="UnityEngine.IMGUIModule">
       <HintPath>C:\Users\ayaki\Documents\PicturePoker_v1.5.0\Picture Poker_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
       <Private>False</Private>
