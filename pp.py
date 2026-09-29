@@ -36,7 +36,7 @@ PORT = 4444
 LOBBIES = {}
 STATE_LOCK = asyncio.Lock()
 DEFAULT_ROUND_TIME = 15
-DISCONNECT_GRACE_PERIOD = 5.0  # Seconds to wait before removing disconnected host/player
+DISCONNECT_GRACE_PERIOD = 5.0
 
 class WSMsgType:
     MyCards = "MyCards"
@@ -191,8 +191,6 @@ async def broadcast_lobby_state(room_id, target_writer=None):
         lobby["state"]["roundsRemaining"] = tot
         
     lobby["state"]["lastActivity"] = get_now_iso()
-
-    # Sort deterministically by playerNumber
     lobby["state"]["players"].sort(key=lambda x: x.get("playerNumber", 0))
 
     payload_str = json.dumps({
@@ -232,7 +230,6 @@ async def delayed_purge_client(room_id, client_id):
             if not lobby["state"]["inProgress"]:
                 lobby["state"]["players"].remove(p)
 
-            # Reassign host if the host is disconnected permanently
             if lobby["state"]["host"] == client_id:
                 active_players = [player for player in lobby["state"]["players"] if player.get("connected", False)]
                 lobby["state"]["host"] = active_players[0]["id"] if active_players else None
@@ -258,11 +255,9 @@ async def purge_client_connection(writer, room_id, client_id=None):
             target_id = p["id"]
             p["connected"] = False
 
-            # Cancel existing grace task if present
             if target_id in lobby["disconnect_tasks"]:
                 lobby["disconnect_tasks"][target_id].cancel()
 
-            # Schedule delayed disconnect to allow reconnecting during scene changes
             task = asyncio.create_task(delayed_purge_client(room_id, target_id))
             lobby["disconnect_tasks"][target_id] = task
 
@@ -422,7 +417,6 @@ async def handle_client(reader, writer):
                             client_id = target_pid
                             lobby["clients"][client_id] = {"writer": writer, "reader": reader}
 
-                            # Cancel pending disconnect grace task if reconnecting
                             if client_id in lobby["disconnect_tasks"]:
                                 lobby["disconnect_tasks"][client_id].cancel()
                                 del lobby["disconnect_tasks"][client_id]
@@ -482,7 +476,6 @@ async def handle_client(reader, writer):
                                 except (ValueError, TypeError):
                                     pass
 
-                            # Forward raw MyCoins frame directly to peer clients
                             await broadcast_to_lobby(room_id, raw_text, exclude_writer=writer)
 
                         elif msg_type == WSMsgType.Start:
@@ -501,15 +494,19 @@ async def handle_client(reader, writer):
                                 try:
                                     val = int(packet["data"])
                                     if val > 0:
-                                        if time.time() - lobby.get("start_time", 0) < 2.0 and val > 1:
-                                            lobby["state"]["currentRound"] = 1
-                                        elif lobby["state"]["inProgress"]:
-                                            lobby["state"]["currentRound"] = val
-                                        elif client_id == lobby["state"]["host"]:
-                                            lobby["state"]["roundCount"] = val
-                                            lobby["state"]["roundsRemaining"] = val
-                                        
-                                        await broadcast_lobby_state(room_id)
+                                        if not lobby["state"]["inProgress"]:
+                                            if client_id == lobby["state"]["host"]:
+                                                lobby["state"]["roundCount"] = val
+                                                lobby["state"]["roundsRemaining"] = val
+                                                await broadcast_lobby_state(room_id)
+                                        else:
+                                            # Enforce round 1 for 2 seconds after game start
+                                            time_since_start = time.time() - lobby.get("start_time", 0)
+                                            if time_since_start >= 2.0:
+                                                lobby["state"]["currentRound"] = val
+                                                await broadcast_lobby_state(room_id)
+                                            else:
+                                                logger.info(f"[SERVER] Blocked early round change ({val}) within 2s start grace period.")
                                 except (ValueError, TypeError):
                                     pass
 
