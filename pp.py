@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import sys
+import time
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -113,7 +114,8 @@ def get_or_create_lobby(lobby_id):
             },
             "clients": {},
             "round_ready": set(),
-            "player_rounds": {}
+            "player_rounds": {},
+            "start_time": 0
         }
     return LOBBIES[lobby_id]
 
@@ -378,6 +380,7 @@ async def handle_client(reader, writer):
                             lobby["state"]["phase"] = "GAME"
                             lobby["state"]["currentRound"] = 1
                             lobby["state"]["roundsRemaining"] = lobby["state"]["roundCount"]
+                            lobby["start_time"] = time.time()  # Record start time for 2s startup lock
                             await broadcast_lobby_state(room_id)
 
                         elif msg_type in (WSMsgType.SetRoundCount, WSMsgType.LobbyRoundChange, "UpdateRoundCount"):
@@ -386,7 +389,10 @@ async def handle_client(reader, writer):
                                 try:
                                     val = int(packet["data"])
                                     if val > 0:
-                                        if lobby["state"]["inProgress"]:
+                                        # Lock to Round 1 if client sends early round-increment packet during start window
+                                        if time.time() - lobby.get("start_time", 0) < 2.0 and val > 1:
+                                            lobby["state"]["currentRound"] = 1
+                                        elif lobby["state"]["inProgress"]:
                                             lobby["state"]["currentRound"] = val
                                         else:
                                             lobby["state"]["roundCount"] = val
