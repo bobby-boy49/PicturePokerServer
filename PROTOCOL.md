@@ -1,6 +1,6 @@
 # Picture Poker Server Protocol & Architecture Specification
 
-This is an overview of my current understanding of how the client server connection "works" please keep in mind that this isn't 100% and is subject to change if I realize something new or just realize that something is just wrong.
+This is an overview of my current understanding of how the client/server connection "works" please keep in mind that this isn't 100% and is subject to change if I realize something new or just realize that something is just wrong.
 
 ## 1. Overview & Network Framing
 This document specifies the network communication protocol and game state management rules for the Picture Poker multiplayer backend server.
